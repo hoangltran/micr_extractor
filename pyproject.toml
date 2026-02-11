@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "micr-extraction"
+version = "0.1.0"
+description = "Enterprise MICR E-13B text extraction from check images"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+tesseract = [
+    "pytesseract>=0.3.10",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+micr-extract = "micr.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["micr*"]

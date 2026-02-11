@@ -1,0 +1,14 @@
+# Ignore .claude directory
+.claude/
+# Ignore .vscode directory
+.vscode/
+# Ignore .idea directory
+.idea/
+# Ignore pytest cache
+__pycache__/
+.pytest_cache/
+# Ignore virtual environment directories
+venv/
+env/
+# Ignore .png files
+*.png
