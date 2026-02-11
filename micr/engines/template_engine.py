@@ -10,6 +10,10 @@ from micr.models import CharacterResult
 
 _DEFAULT_TEMPLATES_DIR = Path(__file__).parent.parent / "resources" / "templates"
 
+# Standard height for MICR line normalization. All segmentation thresholds
+# (min_area, min_h, grouping distances) are tuned for this resolution.
+STANDARD_LINE_HEIGHT = 100
+
 
 class TemplateMatchingEngine(BaseMICREngine):
     """
@@ -63,16 +67,25 @@ class TemplateMatchingEngine(BaseMICREngine):
         if np.mean(binary) > 127:
             binary = cv2.bitwise_not(binary)
 
-        char_rois = self._segment_characters(binary)
+        # Normalize to standard height so segmentation thresholds work
+        # at any input resolution (e.g. 20px low-res or 300px high-res)
+        normalized, scale_x, scale_y = _normalize_to_standard_height(binary)
+
+        char_rois = self._segment_characters(normalized)
 
         results = []
         for roi, bbox in char_rois:
             best_char, best_score = self._classify_character(roi)
+            # Map bbox back to original image coordinates
+            ox = int(round(bbox[0] * scale_x))
+            oy = int(round(bbox[1] * scale_y))
+            ow = int(round(bbox[2] * scale_x))
+            oh = int(round(bbox[3] * scale_y))
             results.append(
                 CharacterResult(
                     character=best_char,
                     confidence=best_score,
-                    bbox=bbox,
+                    bbox=(ox, oy, ow, oh),
                     engine=self.name,
                 )
             )
@@ -401,6 +414,45 @@ def _trim_roi(roi: np.ndarray) -> np.ndarray:
     if trimmed.shape[0] < 3 or trimmed.shape[1] < 3:
         return roi
     return trimmed
+
+
+def _normalize_to_standard_height(
+    binary: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    """
+    Resize a binary MICR line image to STANDARD_LINE_HEIGHT.
+
+    Ensures segmentation thresholds work consistently regardless of input
+    resolution. Images already near the standard height (80-120px) are
+    returned as-is to avoid unnecessary resampling artifacts.
+
+    Returns:
+        (normalized_image, scale_x, scale_y) where scale factors map
+        from normalized coordinates back to original coordinates.
+    """
+    h, w = binary.shape[:2]
+
+    if 80 <= h <= 120:
+        return binary, 1.0, 1.0
+
+    scale = STANDARD_LINE_HEIGHT / h
+    new_w = max(1, int(round(w * scale)))
+    new_h = STANDARD_LINE_HEIGHT
+
+    # INTER_NEAREST preserves sharp edges in binary images; smooth
+    # interpolation (CUBIC/LANCZOS) blurs edges and corrupts characters
+    # after re-thresholding.  INTER_AREA remains best for downscaling.
+    interpolation = cv2.INTER_NEAREST if scale > 1.0 else cv2.INTER_AREA
+    resized = cv2.resize(binary, (new_w, new_h), interpolation=interpolation)
+
+    # Re-threshold to restore clean binary after interpolation
+    _, resized = cv2.threshold(resized, 127, 255, cv2.THRESH_BINARY)
+
+    # Scale factors to map normalized coords → original coords
+    scale_x = w / new_w
+    scale_y = h / new_h
+
+    return resized, scale_x, scale_y
 
 
 def _split_wide_contour(

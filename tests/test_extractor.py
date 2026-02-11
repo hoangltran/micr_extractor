@@ -103,3 +103,72 @@ class TestMICRExtractor:
     def test_file_not_found(self, extractor):
         with pytest.raises(FileNotFoundError):
             extractor.extract("nonexistent.png")
+
+
+class TestLowResolution:
+    """Test that the template engine handles various input resolutions.
+
+    Tests call engine.recognize() directly with pre-processed MICR line
+    images at different heights. This isolates the normalization logic
+    from the preprocessing pipeline (blur/morphological ops can degrade
+    very low-res images before normalization gets a chance to help).
+    """
+
+    @staticmethod
+    def _make_micr_line_at_height(target_height):
+        """Load MICR.png, locate the MICR line, and resize to target_height."""
+        import cv2
+        from micr.preprocessing.scanner_pipeline import preprocess_scanner
+        from micr.preprocessing.micr_locator import locate_micr_line
+
+        image = cv2.imread(str(SAMPLE_IMAGE))
+        binary = preprocess_scanner(image)
+        micr_roi = locate_micr_line(binary)
+        h, w = micr_roi.shape[:2]
+        scale = target_height / h
+        new_w = max(1, int(round(w * scale)))
+        interp = cv2.INTER_NEAREST if scale > 1.0 else cv2.INTER_AREA
+        resized = cv2.resize(micr_roi, (new_w, target_height), interpolation=interp)
+        _, resized = cv2.threshold(resized, 127, 255, cv2.THRESH_BINARY)
+        return resized
+
+    def test_low_res_25px(self):
+        """A 25px-tall MICR line should still extract correct fields.
+
+        25px is the practical minimum — below this, multi-part symbols
+        (Transit: bar + 2 dots) lose their structure and are misclassified.
+        """
+        from micr.engines.template_engine import TemplateMatchingEngine
+        from micr.parsing.parser import parse_micr_line
+
+        engine = TemplateMatchingEngine()
+        micr_25 = self._make_micr_line_at_height(25)
+        chars = engine.recognize(micr_25)
+        result = parse_micr_line(chars)
+        assert result.routing_number == "267084131"
+        assert result.account_number == "790319013"
+        assert result.check_number == "1024"
+        assert result.routing_valid is True
+
+    def test_high_res_300px(self):
+        """A 300px-tall MICR line should still extract correct fields."""
+        from micr.engines.template_engine import TemplateMatchingEngine
+        from micr.parsing.parser import parse_micr_line
+
+        engine = TemplateMatchingEngine()
+        micr_300 = self._make_micr_line_at_height(300)
+        chars = engine.recognize(micr_300)
+        result = parse_micr_line(chars)
+        assert result.routing_number == "267084131"
+        assert result.account_number == "790319013"
+        assert result.check_number == "1024"
+        assert result.routing_valid is True
+
+    def test_normalization_preserves_binary(self):
+        """Normalized image should be clean binary (only 0 and 255)."""
+        from micr.engines.template_engine import _normalize_to_standard_height
+
+        micr_25 = self._make_micr_line_at_height(25)
+        normalized, _, _ = _normalize_to_standard_height(micr_25)
+        unique_vals = set(normalized.flatten())
+        assert unique_vals <= {0, 255}, f"Expected only 0/255, got {unique_vals}"
