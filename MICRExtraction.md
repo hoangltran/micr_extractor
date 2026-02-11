@@ -104,7 +104,8 @@ Here's how a check image becomes structured data:
                   └──────┬───────┘
                          │
                   ┌──────▼───────┐
-                  │  Validator   │ Routing checksum, field formats
+                  │  Validator   │ Routing checksum, symbol counts,
+                  │              │ field formats, confidence penalty
                   └──────┬───────┘
                          │
                   ┌──────▼───────┐
@@ -159,7 +160,8 @@ MICRExtraction/
 │
 ├── pyproject.toml                     # Dependencies and CLI entry point
 ├── MICR.png                           # Sample image 1
-└── MICR2.png                          # Sample image 2
+├── MICR2.png                          # Sample image 2
+└── MICR3.png                          # Sample image 3 (same check as MICR2, different scan)
 ```
 
 ### How the pieces connect
@@ -184,11 +186,19 @@ This is the heart of the project, and it has three parts: **segmentation**, **fe
 
 ### Part 1: Segmentation — Finding Individual Characters
 
-Given a binary image of the MICR line, we need to find where each character is. OpenCV's `findContours` gives us the outline of every blob of white pixels. For most digits, that's one contour per character. Simple.
+Given a binary image of the MICR line, we need to find where each character is. But before we can find characters, we have to deal with the reality that scanned images are messy. Scratches, ink smudges, and other artifacts can connect to characters, distort bounding boxes, and trick the classifier. The segmentation pipeline has **four stages**: noise suppression, contour detection, anomaly correction, and contour grouping.
 
-But the special symbols throw a wrench into this. The Transit symbol (⑈) isn't one connected shape — it's a vertical bar and two separate dots. That's **three** contours for one character. The On-Us symbol (⑆) is two separate thin bars. If we treat each contour as a separate character, we'll see three "characters" where there's actually one Transit symbol.
+**Stage 1: Text band masking.** The MICR line occupies a specific vertical band in the image. Noise artifacts (scratches, marks from the check transport mechanism) tend to appear above or below this band. We compute the horizontal projection — the sum of white pixels in each row — and identify the band of rows where the real characters live (rows exceeding 10% of the peak row sum). Everything above and below gets zeroed out. Think of it as cropping the image to just the lane where the text lives, ignoring graffiti on the sidewalk.
 
-The solution is **contour grouping**, and it took three iterations to get right (more on the bugs below). We use a two-pass approach:
+**Stage 2: Contour detection.** OpenCV's `findContours` gives us the outline of every blob of white pixels. Small blobs are filtered out: anything shorter than 13% of image height or smaller than 50 pixels of area is noise. For most digits, one contour = one character.
+
+**Stage 3: Anomaly correction.** Even after text band masking, some noise can survive inside the character zone. We detect two kinds of anomalous contours by comparing each one against the median dimensions of its neighbors:
+
+- **Wide blobs** (width > 1.6× the median): probably two characters bridged by noise. We examine the vertical projection profile within the blob, find the valley between the two character peaks, and split there. Imagine you merged two mountain ranges with a dirt bridge — the valley between them tells you where the bridge is.
+
+- **Tall contours** near the image edge (height > 1.25× median, touching the top or bottom 15%): a character with noise extending it vertically. We trim it back to the expected character zone computed from its normal-height neighbors.
+
+**Stage 4: Contour grouping.** The special symbols throw a wrench into simple "one contour = one character" logic. The Transit symbol (⑈) isn't one connected shape — it's a vertical bar and two separate dots. That's **three** contours for one character. We use a two-pass approach:
 
 **Pass 1: Tight grouping.** Any contours that overlap or are extremely close (gap < 20% of character height, roughly 9 pixels) get merged. This handles the On-Us symbol's two bars (5px apart) and the Transit dots (which overlap in x-coordinate).
 
@@ -215,6 +225,8 @@ For each segmented character, we compute a feature vector — a numerical "finge
 7. **Half-Densities** — The density of each quadrant (top/bottom, left/right). Digit 2 has more pixels in the top-right and bottom-left. Digit 5 has the opposite pattern.
 
 ### Part 3: Classification — Finding the Best Match
+
+Before computing features, each ROI is **trimmed**: edge columns and rows where the projection drops below 10% of the peak are stripped off. This removes thin noise tails that inflate the bounding box without being part of the actual character. For consistency, the same trimming is applied to reference templates when they're loaded. This turned out to be critical — a digit "9" with a thin noise trail had its aspect ratio inflated from 0.72 to 0.95, making it look more like an On-Us symbol than a nine (more on this in Bug #6 below).
 
 We compare the input character's feature vector against the stored reference features for all 14 characters. Each feature contributes a similarity score, weighted by importance:
 
@@ -342,6 +354,66 @@ The mitigation: always test with diverse inputs. If MICR.png was our only test i
 
 More broadly: a single bad pixel can poison everything downstream. Preprocessing isn't glamorous, but it's where most real-world vision systems succeed or fail.
 
+### Bug #6: The Scratch That Split an Account in Half
+
+**What happened:** MICR3.png — a different scan of the same check as MICR2.png — detected **two** On-Us symbols instead of one. The routing number's checksum failed, and the account number was truncated. Same check, different scan, completely different (and wrong) output.
+
+**Why it happened:** Three problems, all caused by a single root issue: thin diagonal scratches at the top of the scanned image.
+
+Looking at the binary image, rows 0-14 had almost no legitimate character content (< 20 white pixels per row vs 500+ for real text rows). But scattered within those rows were thin marks — probably from the check transport mechanism in the scanner. These marks extended downward and connected to the MICR characters below during binarization.
+
+The scratch caused three cascading failures:
+
+1. **A merged blob.** A 13-pixel-wide mark at x=1247 bridged two adjacent digits ("0" and "2") into a single contour 116 pixels wide — more than double any normal character. This monster was classified as "4" because nothing in the template set looked like two digits mashed together.
+
+2. **A distorted digit.** Another scratch at x=395 connected to a digit "0", extending its bounding box from the normal y=33 up to y=0. The extra height changed its aspect ratio and structural features enough that it matched "7" instead of "0".
+
+3. **A false On-Us.** After the merged blob ate "02", the digit "9" that followed it had a thin noise tail trailing off its right edge. Just 14 columns of 2-6 pixels each — invisible to the human eye in the full image, but enough to inflate the character's aspect ratio from 0.72 (which correctly matches digit "9") to 0.95 (which more closely matches the On-Us symbol at 1.05). The classifier saw two-ish vertical bars and called it On-Us.
+
+**The fix:** A three-layer defense:
+
+1. **Text band masking.** Compute the horizontal projection (row sums). Rows with less than 10% of the peak sum are clearly not character rows — zero them out. This catches edge noise in the top and bottom margins where characters never appear.
+
+2. **Anomalous contour correction.** After contour detection, compare each contour against the median character dimensions. Wide blobs (> 1.6× median width) get split at vertical projection gaps — we literally look for the valley between the two merged peaks. Tall contours near the image edge (> 1.25× median height) get trimmed back to the expected character zone.
+
+3. **ROI trimming.** Before classification, strip trailing low-density edges (< 10% of peak projection) from each character's region of interest. This catches the thin noise tail on the "9" that inflated its aspect ratio. Applied consistently to both templates and input ROIs so the comparison stays fair.
+
+**The lesson:** Real-world images are adversarial. Not maliciously, but relentlessly. A clean image works perfectly. A slightly dirty image introduces correlated failures that cascade through the pipeline. The scratch didn't just cause one error — it caused three, each in a different subsystem (segmentation, grouping, classification).
+
+The defense-in-depth approach mirrors how production systems handle failures: you don't rely on a single guard. The text band mask catches the obvious edge noise. The anomaly correction catches what leaks through. The ROI trimming catches what even the anomaly correction misses. Each layer is simple; together they're robust.
+
+And notice the debugging pattern: we didn't guess at a fix. We visualized the horizontal projection to understand the text band. We printed the vertical projection of the merged blob to find the split point. We compared the feature vectors of the false On-Us against the real "9" template to discover the aspect ratio was the discriminator. Each step was driven by data, not intuition. When the image looks correct to your eyes but wrong to the algorithm, the features are your microscope.
+
+### Bug #7: The Confident Liar
+
+**What happened:** Before we fixed Bug #6, the broken MICR3.png output had 2 On-Us symbols, a failed routing checksum, and a truncated account number — yet reported 89.72% confidence. The confidence score was actively misleading. A consumer of the API would see "almost 90% sure" and might trust the clearly wrong result.
+
+**Why it happened:** The confidence was computed as the simple average of individual character confidences. Each character was matched against *something* in the template set and scored against its best match. Even a badly segmented character will have a "best" match — the question is whether that match is meaningful. The merged blob scored 62% against "4". The false On-Us scored 78% against On-Us. These aren't terrible scores in isolation, and they get averaged with the 93-97% scores of the correctly read characters, pulling the overall confidence up.
+
+The system had no concept of **structural validity**. It checked each character independently but never asked: "Does this sequence of characters make sense as a MICR line?"
+
+**The fix:** The validator now performs **structural validation** beyond just the routing checksum:
+
+- **Symbol count checks:** A valid MICR line should have exactly 2 Transit symbols and 1-2 On-Us symbols. 0, or 3+ of either is a red flag.
+- **Confidence penalty:** When structural issues are detected, the overall confidence is penalized. A failed routing checksum alone knocks 40% off. Wrong symbol counts add another 30% each. Multiple issues stack. That "89.72% confident" broken read becomes 53.8% after the checksum penalty — or 26.9% if symbol counts are also wrong. Now the confidence score tells the truth: "something is seriously wrong here."
+
+The penalty schedule:
+
+| Issue | Penalty | Rationale |
+|-------|---------|-----------|
+| Routing checksum failure | -40% | The built-in error detection caught a problem |
+| No routing number at all | -50% | The most critical field is missing |
+| Wrong Transit count | -30% | Line structure is broken |
+| Wrong On-Us count | -30% | Field delimiters are wrong |
+| No account number | -20% | Second most critical field missing |
+| Wrong routing length | -20% | Not a valid ABA number |
+
+**The lesson:** A confidence score that doesn't account for domain-level consistency is worse than no confidence score at all. It creates a false sense of security. In any system that produces a "confidence" metric, you need to distinguish between **local confidence** (how well does each piece match?) and **global confidence** (does the whole picture make sense?).
+
+This is the same principle behind checksums, parity bits, and error-correcting codes — redundant information that lets you detect when something has gone wrong. The routing number checksum was designed for this exact purpose in the 1950s. We just extended the idea to the full MICR line structure.
+
+More generally: if your system can detect that it's wrong, it should say so. A system that confidently returns garbage is more dangerous than one that says "I don't know."
+
 ---
 
 ## How Good Engineers Think: Patterns From This Project
@@ -376,6 +448,18 @@ Our programmatic templates (rectangles on a canvas) had the right general struct
 
 MICR.png had digits 0-4, 6-9, and symbols Transit and On-Us. It did NOT have digit 5, Amount, or Dash. Everything worked perfectly on MICR.png and was silently wrong on MICR2.png (which had 5s). The first test image gives you confidence. The second test image gives you truth.
 
+### 7. Defense in Depth: Don't Rely on One Guard
+
+The noise handling in segmentation uses three layers: text band masking, anomaly correction, and ROI trimming. None of them alone solves the MICR3.png problem. The text band mask catches the obvious edge noise but misses marks that extend into the character zone. The anomaly correction catches merged blobs and tall contours but doesn't fix subtle feature distortion. The ROI trimming catches trailing noise on individual characters but can't help with characters that were merged at the contour level.
+
+Each layer is simple and has clear failure modes. Together they cover each other's gaps. This is the [Swiss cheese model](https://en.wikipedia.org/wiki/Swiss_cheese_model) of error prevention: each layer has holes, but the holes don't line up.
+
+The same principle applies to the confidence system: individual character matching is the first check, the routing checksum is the second, symbol count validation is the third, and the confidence penalty makes the result honest about what it found.
+
+### 8. If Your System Can Detect It's Wrong, Make It Say So
+
+The routing checksum is a gift — it tells us when our read is wrong. But before Bug #7's fix, we checked the checksum, noticed the failure, added it as a warning... and still reported 89% confidence. The information existed to flag the problem, but we weren't using it to adjust the signal that consumers actually look at: the confidence number. When you have built-in error detection, wire it into the output that people trust.
+
 ---
 
 ## Potential Pitfalls and How to Avoid Them
@@ -394,6 +478,15 @@ If your template set doesn't include a character, the system will confidently ma
 
 ### Pitfall: Confusing pixel gaps with visual gaps
 When analyzing contour gaps, the "gap" is measured from the right edge of one bounding box to the left edge of the next. But bounding boxes can be slightly larger than the visible character due to anti-aliasing. A "gap" of 11 pixels might visually look like 13 pixels of whitespace. Always measure from the actual bounding rectangles, not from visual inspection.
+
+### Pitfall: Edge noise from scanner transport mechanisms
+Check scanners use rollers and belts to move the paper past the sensor. These mechanisms can leave faint marks — scratches, smudges, roller traces — at the top and bottom edges of the image. After binarization, these marks become thin bridges connecting to MICR characters, merging separate characters into blobs or distorting bounding boxes. **Always inspect the top and bottom 10-15 rows of your binary images.** Text band masking (zeroing rows below a threshold of horizontal projection) is a reliable defense.
+
+### Pitfall: Confidence scores that don't account for consistency
+Averaging per-character confidence scores gives you a number that feels reliable but ignores whether the output makes structural sense. A system that reads "⑈063⑈⑆00047⑆⑈" with 85% average character confidence is confidently wrong. **Always layer domain-level validation on top of character-level confidence** — checksum verification, expected symbol counts, field length checks. Penalize the confidence score when these checks fail, so consumers of your API get an honest signal.
+
+### Pitfall: Different scans of the same document can produce different errors
+MICR2.png and MICR3.png are the same check. MICR2 read perfectly. MICR3 had three cascading errors from scanner artifacts that MICR2 didn't have. **Never assume that passing on one scan of a document means you'll pass on all scans.** If possible, test with multiple scans of the same source material at different quality levels.
 
 ---
 
@@ -474,4 +567,6 @@ python -m pytest tests/ -v
 
 ## Final Thought
 
-This project started as "read some text from an image" and turned into a lesson in how domain knowledge, thoughtful preprocessing, and robust feature engineering can outperform brute-force approaches. The MICR E-13B standard was designed in the 1950s to be machine-readable — but the machines they had in mind were magnetic readers, not cameras. Sixty years later, a few hundred lines of Python and some 1962 mathematics can do it from a photograph. That's progress.
+This project started as "read some text from an image" and turned into a lesson in how domain knowledge, thoughtful preprocessing, and robust feature engineering can outperform brute-force approaches. Along the way it also became a lesson in how real-world data is adversarial — not maliciously, but relentlessly. The clean image works perfectly. The slightly dirty image reveals every assumption you didn't know you were making. The fix is never just one thing; it's layers of defense, each simple, that together create resilience.
+
+The MICR E-13B standard was designed in the 1950s to be machine-readable — but the machines they had in mind were magnetic readers, not cameras. Seventy years later, a few hundred lines of Python and some 1962 mathematics can do it from a photograph. And when the photograph has scratches on it, a few more lines of Python can handle that too. That's progress.
