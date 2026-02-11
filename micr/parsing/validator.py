@@ -23,6 +23,9 @@ def validate_routing_number(routing: str) -> bool:
 def validate_micr_result(result: MICRResult) -> list[str]:
     """
     Validate a complete MICR extraction result and return a list of warnings.
+
+    Also penalizes overall_confidence when structural issues are detected
+    (e.g. wrong symbol counts, failed routing checksum).
     """
     warnings = []
 
@@ -40,9 +43,59 @@ def validate_micr_result(result: MICRResult) -> list[str]:
     elif not result.account_number.isdigit():
         warnings.append("Account number contains non-digit characters")
 
+    # Validate expected symbol counts
+    transit_count = sum(
+        1 for c in result.characters if c.character == "transit"
+    )
+    on_us_count = sum(
+        1 for c in result.characters if c.character == "on_us"
+    )
+
+    if transit_count != 2:
+        warnings.append(
+            f"Expected 2 transit symbols, found {transit_count}"
+        )
+    if on_us_count == 0:
+        warnings.append("No on-us symbol detected")
+    elif on_us_count > 2:
+        warnings.append(
+            f"Expected 1-2 on-us symbols, found {on_us_count}"
+        )
+
+    # Penalize confidence for structural issues
+    penalty = _compute_confidence_penalty(warnings)
+    if penalty > 0:
+        result.overall_confidence *= (1.0 - penalty)
+
     if result.overall_confidence < 0.7:
         warnings.append(
             f"Low overall confidence: {result.overall_confidence:.2f}"
         )
 
     return warnings
+
+
+def _compute_confidence_penalty(warnings: list[str]) -> float:
+    """
+    Compute a confidence penalty based on validation warnings.
+
+    Returns a value between 0.0 (no penalty) and 1.0 (zero confidence).
+    Multiple issues stack: each issue adds to the penalty.
+    """
+    penalty = 0.0
+
+    for w in warnings:
+        if "checksum" in w:
+            penalty += 0.40
+        elif "No routing number" in w:
+            penalty += 0.50
+        elif "transit symbols" in w:
+            penalty += 0.30
+        elif "on-us symbol" in w:
+            penalty += 0.30
+        elif "No account number" in w:
+            penalty += 0.20
+        elif "digits, expected 9" in w:
+            penalty += 0.20
+
+    return min(penalty, 1.0)

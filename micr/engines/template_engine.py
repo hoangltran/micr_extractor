@@ -43,6 +43,7 @@ class TemplateMatchingEngine(BaseMICREngine):
                 tpl = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
                 if tpl is not None:
                     _, tpl_bin = cv2.threshold(tpl, 127, 255, cv2.THRESH_BINARY)
+                    tpl_bin = _trim_roi(tpl_bin)
                     self._ref_features[char_name] = _compute_features(tpl_bin)
 
         if not self._ref_features:
@@ -82,6 +83,8 @@ class TemplateMatchingEngine(BaseMICREngine):
         self, binary: np.ndarray
     ) -> list[tuple[np.ndarray, tuple[int, int, int, int]]]:
         """Segment individual characters using contour detection and grouping."""
+        binary = self._mask_text_band(binary)
+
         contours, _ = cv2.findContours(
             binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -104,6 +107,12 @@ class TemplateMatchingEngine(BaseMICREngine):
 
         rects.sort(key=lambda r: r[0])
 
+        # Fix noise-merged or noise-extended contours
+        rects = self._fix_anomalous_contours(rects, binary)
+
+        if not rects:
+            return []
+
         # Group nearby contours belonging to the same character
         grouped = self._group_contours(rects, h_img)
 
@@ -119,6 +128,108 @@ class TemplateMatchingEngine(BaseMICREngine):
                 results.append((roi, (x0, y0, x1 - x0, y1 - y0)))
 
         return results
+
+    @staticmethod
+    def _fix_anomalous_contours(
+        rects: list[tuple[int, int, int, int]], binary: np.ndarray
+    ) -> list[tuple[int, int, int, int]]:
+        """
+        Fix contours corrupted by edge noise.
+
+        Handles two cases:
+        1. Wide blobs: noise bridges two adjacent digits into one contour.
+           Split at vertical projection gaps.
+        2. Tall contours: noise at the image edge connects to a character,
+           extending it vertically. Trim to the normal character zone.
+        """
+        if len(rects) < 3:
+            return rects
+
+        # Compute median dimensions from normal contours
+        heights = sorted(r[3] for r in rects)
+        widths = sorted(r[2] for r in rects)
+        median_h = heights[len(heights) // 2]
+        median_w = widths[len(widths) // 2]
+
+        # Compute expected vertical character zone from normal contours
+        normal_rects = [r for r in rects if 0.7 * median_h <= r[3] <= 1.3 * median_h]
+        if normal_rects:
+            char_top = int(np.median([r[1] for r in normal_rects]))
+            char_bottom = int(np.median([r[1] + r[3] for r in normal_rects]))
+        else:
+            char_top = int(np.median([r[1] for r in rects]))
+            char_bottom = int(np.median([r[1] + r[3] for r in rects]))
+
+        h_img = binary.shape[0]
+        fixed = []
+
+        for x, y, w, h in rects:
+            # Case 1: Wide blob — likely two merged characters
+            if w > median_w * 1.6 and w > median_h * 0.9:
+                sub_rects = _split_wide_contour(binary, x, y, w, h, median_w)
+                if sub_rects:
+                    fixed.extend(sub_rects)
+                    continue
+
+            # Case 2: Tall contour touching edge — noise-extended
+            if h > median_h * 1.25 and (y < h_img * 0.15 or y + h > h_img * 0.85):
+                margin = max(2, int(median_h * 0.05))
+                new_y = max(0, char_top - margin)
+                new_bottom = min(h_img, char_bottom + margin)
+                new_h = new_bottom - new_y
+                if new_h >= median_h * 0.5:
+                    fixed.append((x, new_y, w, new_h))
+                    continue
+
+            fixed.append((x, y, w, h))
+
+        return fixed
+
+    @staticmethod
+    def _mask_text_band(binary: np.ndarray) -> np.ndarray:
+        """
+        Mask out noise above and below the main MICR text band.
+
+        Uses horizontal projection to find the vertical extent of the
+        actual characters. Noise artifacts at the top/bottom edges of
+        the image (scratches, marks) are zeroed out so they don't merge
+        with real characters during contour detection.
+        """
+        h, w = binary.shape
+        row_sums = np.sum(binary > 0, axis=1)
+        max_sum = row_sums.max()
+
+        if max_sum == 0:
+            return binary
+
+        # Rows with content above 10% of the peak are considered text rows.
+        # Noise rows typically have <2% while character rows have >15%.
+        threshold = max_sum * 0.10
+        active = row_sums > threshold
+
+        if not np.any(active):
+            return binary
+
+        active_indices = np.where(active)[0]
+        top = int(active_indices[0])
+        bottom = int(active_indices[-1])
+
+        # Add a small margin (2% of height, min 2px)
+        margin = max(2, int(h * 0.02))
+        top = max(0, top - margin)
+        bottom = min(h - 1, bottom + margin)
+
+        # If the text band is already the full image, nothing to mask
+        if top <= 0 and bottom >= h - 1:
+            return binary
+
+        result = binary.copy()
+        if top > 0:
+            result[:top, :] = 0
+        if bottom < h - 1:
+            result[bottom + 1:, :] = 0
+
+        return result
 
     def _group_contours(
         self, rects: list[tuple[int, int, int, int]], img_height: int
@@ -231,6 +342,10 @@ class TemplateMatchingEngine(BaseMICREngine):
         if char_roi.shape[0] < 3 or char_roi.shape[1] < 3:
             return "?", 0.0
 
+        char_roi = _trim_roi(char_roi)
+        if char_roi.shape[0] < 3 or char_roi.shape[1] < 3:
+            return "?", 0.0
+
         roi_features = _compute_features(char_roi)
 
         best_char = "?"
@@ -243,6 +358,117 @@ class TemplateMatchingEngine(BaseMICREngine):
                 best_char = char_name
 
         return best_char, best_score
+
+
+def _trim_roi(roi: np.ndarray) -> np.ndarray:
+    """
+    Trim low-density edges from a character ROI.
+
+    Noise artifacts can add thin trailing pixels that inflate the bounding
+    box. This trims columns/rows from the edges where the projection is
+    below 10% of the peak, restoring the true character dimensions.
+    """
+    h, w = roi.shape[:2]
+    if h < 3 or w < 3:
+        return roi
+
+    # Trim columns from left and right
+    v_proj = np.sum(roi > 0, axis=0)
+    v_peak = v_proj.max()
+    if v_peak == 0:
+        return roi
+
+    v_threshold = v_peak * 0.10
+    left = 0
+    while left < w and v_proj[left] < v_threshold:
+        left += 1
+    right = w - 1
+    while right > left and v_proj[right] < v_threshold:
+        right -= 1
+
+    # Trim rows from top and bottom
+    h_proj = np.sum(roi > 0, axis=1)
+    h_peak = h_proj.max()
+    h_threshold = h_peak * 0.10
+    top = 0
+    while top < h and h_proj[top] < h_threshold:
+        top += 1
+    bottom = h - 1
+    while bottom > top and h_proj[bottom] < h_threshold:
+        bottom -= 1
+
+    trimmed = roi[top:bottom + 1, left:right + 1]
+    if trimmed.shape[0] < 3 or trimmed.shape[1] < 3:
+        return roi
+    return trimmed
+
+
+def _split_wide_contour(
+    binary: np.ndarray,
+    x: int, y: int, w: int, h: int,
+    median_w: float,
+) -> list[tuple[int, int, int, int]] | None:
+    """
+    Split a wide merged contour at vertical projection gaps.
+
+    When noise bridges two adjacent characters, the result is one contour
+    spanning both. This function finds the gap between them using the
+    vertical projection profile and returns separate bounding boxes.
+
+    Returns None if no clean split point is found.
+    """
+    roi = binary[y:y + h, x:x + w]
+    if roi.size == 0:
+        return None
+
+    v_proj = np.sum(roi > 0, axis=0).astype(float)
+    peak = v_proj.max()
+    if peak == 0:
+        return None
+
+    # Look for a valley in the middle region (25%-75% of width)
+    search_start = int(w * 0.25)
+    search_end = int(w * 0.75)
+    if search_end <= search_start:
+        return None
+
+    search_region = v_proj[search_start:search_end]
+    if len(search_region) == 0:
+        return None
+
+    # Find the minimum in the search region
+    min_idx = int(np.argmin(search_region))
+    min_val = search_region[min_idx]
+
+    # The valley must be significantly lower than the peaks (< 25% of peak)
+    if min_val > peak * 0.25:
+        return None
+
+    split_col = search_start + min_idx
+
+    # Find the extent of the gap (consecutive low columns)
+    gap_threshold = peak * 0.20
+    gap_start = split_col
+    while gap_start > search_start and v_proj[gap_start - 1] < gap_threshold:
+        gap_start -= 1
+    gap_end = split_col
+    while gap_end < search_end - 1 and v_proj[gap_end + 1] < gap_threshold:
+        gap_end += 1
+
+    # Split into two rectangles
+    # Left part: original x to gap_start
+    left_w = gap_start
+    # Right part: gap_end to original end
+    right_x = x + gap_end + 1
+    right_w = w - gap_end - 1
+
+    result = []
+    if left_w > median_w * 0.3:
+        result.append((x, y, left_w, h))
+    if right_w > median_w * 0.3:
+        result.append((right_x, y, right_w, h))
+
+    return result if len(result) >= 2 else None
 
 
 def _compute_features(binary_roi: np.ndarray) -> dict:
@@ -336,13 +562,15 @@ def _compare_features(feat1: dict, feat2: dict) -> float:
     weights.append(2.0)
 
     # Projection profile correlations
-    h_corr = np.corrcoef(feat1["h_proj"], feat2["h_proj"])[0, 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        h_corr = np.corrcoef(feat1["h_proj"], feat2["h_proj"])[0, 1]
     if np.isnan(h_corr):
         h_corr = 0.0
     scores.append(max(0.0, (h_corr + 1.0) / 2.0))
     weights.append(1.5)
 
-    v_corr = np.corrcoef(feat1["v_proj"], feat2["v_proj"])[0, 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v_corr = np.corrcoef(feat1["v_proj"], feat2["v_proj"])[0, 1]
     if np.isnan(v_corr):
         v_corr = 0.0
     scores.append(max(0.0, (v_corr + 1.0) / 2.0))
