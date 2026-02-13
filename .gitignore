@@ -12,3 +12,6 @@ venv/
 env/
 # Ignore .png files
 MICR*.png
+Check*.png
+MICR*.jpg
+Check*.jpg

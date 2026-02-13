@@ -3,6 +3,6 @@
 __version__ = "0.1.0"
 
 from micr.api import MICRExtractor
-from micr.models import MICRResult
+from micr.models import CheckResult, MICRResult
 
-__all__ = ["MICRExtractor", "MICRResult"]
+__all__ = ["MICRExtractor", "MICRResult", "CheckResult"]

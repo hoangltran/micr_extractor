@@ -6,8 +6,9 @@ import cv2
 import numpy as np
 
 from micr.engines.template_engine import TemplateMatchingEngine
-from micr.models import ImageSource, MICRResult
+from micr.models import CheckResult, ImageSource, MICRResult
 from micr.parsing.consensus import resolve_consensus
+from micr.parsing.hybrid import merge_vlm_and_template
 from micr.parsing.parser import parse_micr_line
 from micr.parsing.validator import validate_micr_result
 from micr.preprocessing.micr_locator import locate_micr_line
@@ -29,6 +30,10 @@ class MICRExtractor:
     def __init__(
         self,
         use_tesseract: bool = False,
+        use_vlm: bool = False,
+        vlm_model: str | None = None,
+        ollama_url: str | None = None,
+        vlm_timeout: float = 120.0,
         templates_dir: str | Path | None = None,
         tessdata_dir: str | None = None,
         tesseract_lang: str = "eng",
@@ -38,12 +43,17 @@ class MICRExtractor:
 
         Args:
             use_tesseract: Whether to use Tesseract as a secondary engine.
+            use_vlm: Whether to use a VLM via Ollama for full check extraction.
+            vlm_model: Ollama model name (default: qwen2.5vl:7b).
+            ollama_url: Ollama API URL (default: http://localhost:11434).
+            vlm_timeout: VLM inference timeout in seconds (default: 120).
             templates_dir: Path to E-13B character templates directory.
             tessdata_dir: Path to Tesseract tessdata directory.
             tesseract_lang: Tesseract language code (e.g., 'eng' or 'e13b').
         """
         self._template_engine = TemplateMatchingEngine(templates_dir)
         self._tesseract_engine = None
+        self._vlm_engine = None
 
         if use_tesseract:
             try:
@@ -56,6 +66,24 @@ class MICRExtractor:
                 import warnings
 
                 warnings.warn(f"Tesseract engine unavailable: {e}")
+
+        if use_vlm:
+            try:
+                from micr.engines.vlm_engine import (
+                    DEFAULT_MODEL,
+                    DEFAULT_OLLAMA_URL,
+                    OllamaVLMEngine,
+                )
+
+                self._vlm_engine = OllamaVLMEngine(
+                    model=vlm_model or DEFAULT_MODEL,
+                    base_url=ollama_url or DEFAULT_OLLAMA_URL,
+                    timeout=vlm_timeout,
+                )
+            except (ImportError, RuntimeError) as e:
+                import warnings
+
+                warnings.warn(f"VLM engine unavailable: {e}")
 
     def extract(self, image_path: str | Path) -> MICRResult:
         """
@@ -165,3 +193,60 @@ class MICRExtractor:
                 return ImageSource.CAMERA
 
         return ImageSource.SCANNER
+
+    def extract_check(self, image_path: str | Path) -> CheckResult:
+        """
+        Extract all check fields using VLM + template engine hybrid pipeline.
+
+        Returns CheckResult with MICR fields, legal amount, courtesy amount,
+        payee, and date. Falls back to template-only if VLM is unavailable.
+
+        Args:
+            image_path: Path to the check image file.
+
+        Returns:
+            CheckResult with all extracted fields.
+        """
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise ValueError(f"Cannot read image: {image_path}")
+
+        return self.extract_check_from_array(image)
+
+    def extract_check_from_array(
+        self,
+        image: np.ndarray,
+        image_source: ImageSource = ImageSource.UNKNOWN,
+    ) -> CheckResult:
+        """
+        Extract all check fields from a numpy array.
+
+        Runs template engine first (fast), then VLM (slow), then merges.
+
+        Args:
+            image: Image as numpy array (BGR or grayscale).
+            image_source: Hint about the image source type.
+
+        Returns:
+            CheckResult with all extracted fields.
+        """
+        # Always run template engine for MICR (fast, reliable)
+        template_result = self.extract_from_array(image, image_source)
+
+        # Run VLM if available
+        vlm_result = None
+        if self._vlm_engine:
+            try:
+                vlm_result = self._vlm_engine.extract(
+                    image, image_type="full_check"
+                )
+            except Exception as e:
+                import warnings
+
+                warnings.warn(f"VLM extraction failed: {e}")
+
+        return merge_vlm_and_template(template_result, vlm_result)

@@ -1,0 +1,2 @@
+[console_scripts]
+micr-extract = micr.cli:main

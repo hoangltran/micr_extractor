@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: micr-extraction
+Version: 0.1.0
+Summary: Enterprise MICR E-13B text extraction from check images
+Requires-Python: >=3.10
+Requires-Dist: opencv-python-headless>=4.8
+Requires-Dist: numpy>=1.24
+Requires-Dist: Pillow>=10.0
+Provides-Extra: tesseract
+Requires-Dist: pytesseract>=0.3.10; extra == "tesseract"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
